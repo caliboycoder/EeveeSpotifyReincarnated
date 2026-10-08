@@ -60,6 +60,7 @@ struct EeveeSettingsView: View {
             SettingsEntry(key: "flags", icon: "flag.fill", color: Color(hex: "#5E5CE6")) { AnyView(FlagBrowserView()) },
             SettingsEntry(key: "experiments", icon: "sparkle", color: .purple) { AnyView(EeveeExperimentsSettingsView()) },
             SettingsEntry(key: "download_manager", icon: "arrow.down.circle.fill", color: .blue) { AnyView(EeveeDownloadsSettingsView()) },
+            SettingsEntry(key: "offline_library", icon: "tray.and.arrow.down.fill", color: .green) { AnyView(OfflineLibraryView()) },
             SettingsEntry(key: "miscellaneous", icon: "ellipsis.circle.fill", color: .gray) { AnyView(EeveeMiscellaneousSettingsView()) },
         ]),
     ]

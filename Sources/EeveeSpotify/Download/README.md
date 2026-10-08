@@ -11,6 +11,20 @@ Plain audio files only. It does not download Spotify's own streams (those are en
 - **Podcasts:** search Apple's public iTunes Search API for a show (or paste its RSS link), then
   download episodes from the `<enclosure>` URLs in the show's RSS feed.
 
+## Offline Playback
+
+Downloaded tracks are automatically registered for offline playback. Users can:
+- Browse all downloaded tracks in Settings → Advanced → "My Downloaded Music"
+- Search downloaded tracks by title, artist, or album
+- Play offline tracks directly (uses AVAudioPlayer)
+- See storage used by offline tracks
+- Delete individual tracks or all downloads at once
+
+Downloaded tracks will eventually be integrated into:
+- Spotify's Now Playing screen (with "Available Offline" badge)
+- Playlist views (marking tracks as downloaded)
+- Search results (prioritizing offline versions when available)
+
 ## Status
 
 - Core and sources layer typechecked on macOS with stubs. The SwiftUI screens are only compiled by
@@ -27,6 +41,10 @@ Plain audio files only. It does not download Spotify's own streams (those are en
 - `Sources/DownloadSources.swift`: URL validation, iTunes search, RSS parser.
 - `Storage/DownloadPersistence.swift`: `queue.json` / `history.json` in Application Support.
 - `Storage/FilePathResolver.swift`: destination folder and filename.
+- `Offline/OfflineTrackDatabase.swift`: persistent index of downloaded tracks.
+- `Offline/OfflinePlaybackManager.swift`: playback and playback event observer API.
+- `Offline/OfflineDownloadObserver.swift`: bridges download completions to offline registration.
+- `Offline/OfflineLibraryView.swift`: SwiftUI UI for browsing and playing offline tracks.
 - `DownloadManagerHooks.x.swift`: activation helper and launch-time flags.
 - UI: `Settings/Sections/Downloads/Views/EeveeDownloadsSettingsView.swift`.
 
