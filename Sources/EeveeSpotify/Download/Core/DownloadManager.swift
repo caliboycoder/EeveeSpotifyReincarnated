@@ -41,10 +41,10 @@ final class DownloadManager: NSObject, DownloadManagerProtocol {
 
     /// Maps a track to the URL that should be downloaded.
     ///
-    /// The default only knows about `SpotifyTrack.previewURL`, which is a ~30 second preview clip.
-    /// Replace this closure with a real source to download full tracks.
+    /// Direct audio URLs (`sourceURL`) come first; `previewURL` is the fallback for
+    /// preview-only tracks. Replace this closure to plug in another source.
     var resolveDownloadURL: (SpotifyTrack, DownloadQuality) -> URL? = { track, _ in
-        return track.previewURL.flatMap { URL(string: $0) }
+        return (track.sourceURL ?? track.previewURL).flatMap { URL(string: $0) }
     }
 
     // MARK: - Observers (guarded by observersLock)
@@ -495,7 +495,12 @@ extension DownloadManager: URLSessionDownloadDelegate {
         let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 200
         var staged: URL?
         var stagingError: Error?
-        if (200..<300).contains(status) {
+
+        // A link to a web page (or an error page served with 200) is not audio; don't save it as one.
+        let mime = downloadTask.response?.mimeType?.lowercased() ?? ""
+        let notAudio = mime.hasPrefix("text/") || mime == "application/json" || mime == "application/xml"
+
+        if (200..<300).contains(status) && !notAudio {
             let target = DownloadManager.stagingDirectory.appendingPathComponent("\(itemId).part")
             do {
                 try? FileManager.default.removeItem(at: target)
@@ -519,6 +524,9 @@ extension DownloadManager: URLSessionDownloadDelegate {
             } else if let stagingError = stagingError {
                 self.failLocked(itemId: itemId, error: DownloadError(
                     type: .permission, message: stagingError.localizedDescription, underlyingError: stagingError))
+            } else if notAudio && (200..<300).contains(status) {
+                self.failLocked(itemId: itemId, error: DownloadError(
+                    type: .notFound, message: "The link is not an audio file (\(mime))"))
             } else {
                 self.failLocked(itemId: itemId, error: DownloadError(
                     type: DownloadManager.categorize(httpStatus: status), message: "HTTP \(status)"))

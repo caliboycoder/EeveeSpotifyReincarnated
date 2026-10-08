@@ -244,6 +244,10 @@ struct SpotifyTrack: Codable {
     let durationMs: Int
     let artworkURL: String?
     let previewURL: String?
+    /// Direct URL of a plain audio file (user-supplied URL or podcast RSS enclosure).
+    let sourceURL: String?
+    /// File extension for the saved file, without the dot (e.g. "mp3").
+    let fileExtension: String?
     
     init(
         id: String,
@@ -253,8 +257,12 @@ struct SpotifyTrack: Codable {
         albumName: String,
         durationMs: Int,
         artworkURL: String? = nil,
-        previewURL: String? = nil
+        previewURL: String? = nil,
+        sourceURL: String? = nil,
+        fileExtension: String? = nil
     ) {
+        self.sourceURL = sourceURL
+        self.fileExtension = fileExtension
         self.id = id
         self.isrc = isrc
         self.trackName = trackName

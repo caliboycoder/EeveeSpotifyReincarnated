@@ -114,6 +114,8 @@ class DownloadSettingsIntegration {
 /// so the settings page compares against this to decide whether a restart is needed.
 enum DownloadFeature {
     static let launchEnabled = UserDefaults.downloadOptions.enabled
+    /// The background session reads "Wi-Fi only" once when it is created.
+    static let launchWifiOnly = UserDefaults.downloadOptions.wifiOnly
 }
 
 extension DownloadManager {

@@ -68,8 +68,8 @@ class FilePathResolver {
         let artist = sanitize(item.track.artistName)
         let track = sanitize(item.track.trackName)
         
-        // Determine extension
-        let ext = options.autoConvertFormat?.fileExtension ?? "mp3"
+        // The source's own extension wins: no conversion step exists, so relabelling would be wrong.
+        let ext = item.track.fileExtension ?? options.autoConvertFormat?.fileExtension ?? "mp3"
         
         // Quality label (if enabled)
         var qualityLabel = ""
