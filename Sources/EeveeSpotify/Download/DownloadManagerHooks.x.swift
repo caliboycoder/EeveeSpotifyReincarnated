@@ -110,6 +110,12 @@ class DownloadSettingsIntegration {
 
 // MARK: - Download Manager Initialization Hook
 
+/// Value of the "enabled" option at process launch. The manager is only created at launch,
+/// so the settings page compares against this to decide whether a restart is needed.
+enum DownloadFeature {
+    static let launchEnabled = UserDefaults.downloadOptions.enabled
+}
+
 extension DownloadManager {
     
     /// Initialize download manager when tweak loads

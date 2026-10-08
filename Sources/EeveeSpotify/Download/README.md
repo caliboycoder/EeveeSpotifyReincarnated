@@ -7,7 +7,10 @@ A background download queue for the tweak. Its design borrows from SpotiFLAC-Mob
 
 - Compiles (typechecked with stubs for Orion/UIKit). Not yet run on a device.
 - Disabled by default: `UserDefaults.downloadOptions.enabled` is `false`.
-- There is no UI yet. Nothing calls `addToQueue` from inside Spotify.
+  Toggle it in Settings → Miscellaneous → "Download manager (experimental)", then restart.
+- There is no download button or queue UI yet. Nothing calls `addToQueue` from inside Spotify.
+- No Spotify stream resolver exists. An earlier unverified one was removed: its endpoint was
+  never confirmed and Spotify's audio files are encrypted.
 - `DownloadManager.resolveDownloadURL` only returns `SpotifyTrack.previewURL`
   (a ~30s clip). Replace it with a real source to download full tracks.
 
