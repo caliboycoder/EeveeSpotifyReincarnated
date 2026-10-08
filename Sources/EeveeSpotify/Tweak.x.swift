@@ -243,9 +243,6 @@ struct EeveeSpotify: Tweak {
         activateRemoteFlags()
         activateRatingPromptBlock()
 
-        // Activate offline playback system
-        activateOfflinePlayback()
-        
         // No-op unless UserDefaults.downloadOptions.enabled is true.
         DownloadManager.activateDownloadManager()
 

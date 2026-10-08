@@ -129,6 +129,7 @@ extension DownloadManager {
         
         // Touching the singleton restores the persisted queue and resumes it on its own.
         _ = DownloadManager.shared
+        activateOfflinePlayback()
         writeDebugLog("[DownloadManager] Activated")
     }
 }

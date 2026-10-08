@@ -1,46 +1,24 @@
 import Foundation
 
-// MARK: - Offline Track Models
+// MARK: - Offline Track Model
 
-/// Metadata for a locally-downloaded track
+/// A locally downloaded audio file and its metadata.
 struct OfflineTrack: Codable {
-    /// Unique ID: matches DownloadItem.track.id for correlation
     let trackId: String
-    
-    /// Local file path (full path to saved audio file)
+    /// Absolute path at download time. Use `resolvedFilePath`; the app container path can change.
     let filePath: String
-    
-    /// Track metadata for display/search
     let trackName: String
     let artistName: String
     let albumName: String
-    
-    /// Audio file details
     let fileSize: Int64
-    let duration: Int         // milliseconds
-    let fileExtension: String // "mp3", "m4a", "ogg", etc.
-    
-    /// Artwork URL or embedded data
+    /// Milliseconds, 0 when unknown.
+    let duration: Int
+    let fileExtension: String
     let artworkURL: String?
-    
-    /// When the track was downloaded
     let downloadedAt: Date
-    
-    /// Last time it was played (for sort/filter)
     var lastPlayedAt: Date?
-    
-    /// Play count for this local track
-    var playCount: Int = 0
-    
-    /// Track status
-    var isAvailable: Bool = true  // File still exists
-    
-    /// MARK: - Codable keys (exclude lastPlayedAt/playCount during init)
-    enum CodingKeys: String, CodingKey {
-        case trackId, filePath, trackName, artistName, albumName
-        case fileSize, duration, fileExtension, artworkURL, downloadedAt
-    }
-    
+    var playCount: Int
+
     init(
         trackId: String,
         filePath: String,
@@ -50,7 +28,10 @@ struct OfflineTrack: Codable {
         fileSize: Int64,
         duration: Int,
         fileExtension: String,
-        artworkURL: String? = nil
+        artworkURL: String? = nil,
+        downloadedAt: Date = Date(),
+        lastPlayedAt: Date? = nil,
+        playCount: Int = 0
     ) {
         self.trackId = trackId
         self.filePath = filePath
@@ -61,195 +42,180 @@ struct OfflineTrack: Codable {
         self.duration = duration
         self.fileExtension = fileExtension
         self.artworkURL = artworkURL
-        self.downloadedAt = Date()
+        self.downloadedAt = downloadedAt
+        self.lastPlayedAt = lastPlayedAt
+        self.playCount = playCount
     }
-    
-    /// Check if file still exists on disk
-    mutating func validateAvailability() {
-        isAvailable = FileManager.default.fileExists(atPath: filePath)
+
+    /// The stored path if the file is there, otherwise the same `Documents/...` location under the
+    /// current container (iOS can change the container UUID when an app is reinstalled or updated).
+    var resolvedFilePath: String? {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: filePath) { return filePath }
+
+        let marker = "/Documents/"
+        guard let range = filePath.range(of: marker, options: .backwards),
+              let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let relative = String(filePath[range.upperBound...])
+        let candidate = documents.appendingPathComponent(relative).path
+        return fm.fileExists(atPath: candidate) ? candidate : nil
     }
 }
 
 // MARK: - Database
 
-/// Local database of downloaded/available offline tracks.
+/// Persistent index of downloaded tracks. Thread-safe.
 final class OfflineTrackDatabase {
+
     static let shared = OfflineTrackDatabase()
-    
+
     private let fileManager = FileManager.default
-    private let databasePath: URL
-    private let indexLock = NSLock()
-    
-    /// In-memory index: trackId → OfflineTrack
+    private let indexFile: URL
+    private let lock = NSLock()
     private var index: [String: OfflineTrack] = [:]
-    
-    /// Reverse index: filePath → trackId (for deduplication)
-    private var pathIndex: [String: String] = [:]
-    
-    init() {
-        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        databasePath = appSupport.appendingPathComponent("EeveeSpotify/OfflineTracksDB", isDirectory: true)
-        
-        try? fileManager.createDirectory(at: databasePath, withIntermediateDirectories: true)
-        loadIndex()
+
+    private let ioQueue = DispatchQueue(label: "com.eevee.offline.db", qos: .utility)
+    private var pendingWrite: DispatchWorkItem?
+    private let writeDelay: TimeInterval
+
+    /// - Parameter directory: where `index.json` lives. Defaults to Application Support.
+    init(directory: URL? = nil, writeDelay: TimeInterval = 1.0) {
+        let dir = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("EeveeSpotify/Offline", isDirectory: true)
+        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        self.indexFile = dir.appendingPathComponent("index.json")
+        self.writeDelay = writeDelay
+        load()
     }
-    
-    // MARK: - Query
-    
-    /// Get offline track by Spotify track ID
+
+    // MARK: Query
+
     func offlineTrack(forTrackId trackId: String) -> OfflineTrack? {
-        indexLock.lock(); defer { indexLock.unlock() }
+        lock.lock(); defer { lock.unlock() }
         return index[trackId]
     }
-    
-    /// Check if a track is available offline
+
+    /// True when the track is indexed and its file can be found.
     func isOffline(trackId: String) -> Bool {
-        indexLock.lock(); defer { indexLock.unlock() }
-        guard let track = index[trackId] else { return false }
-        return track.isAvailable && fileManager.fileExists(atPath: track.filePath)
+        return offlineTrack(forTrackId: trackId)?.resolvedFilePath != nil
     }
-    
-    /// Get all offline tracks
+
+    /// Newest first. Entries whose file is gone are skipped (not deleted).
     func allOfflineTracks() -> [OfflineTrack] {
-        indexLock.lock(); defer { indexLock.unlock() }
-        return index.values.filter { $0.isAvailable }.sorted { $0.downloadedAt > $1.downloadedAt }
-    }
-    
-    /// Search offline tracks by name
-    func search(query: String) -> [OfflineTrack] {
-        let lower = query.lowercased()
-        indexLock.lock(); defer { indexLock.unlock() }
-        return index.values.filter { track in
-            track.isAvailable && (
-                track.trackName.lowercased().contains(lower) ||
-                track.artistName.lowercased().contains(lower) ||
-                track.albumName.lowercased().contains(lower)
-            )
-        }.sorted { $0.downloadedAt > $1.downloadedAt }
-    }
-    
-    /// Get total offline storage used
-    func totalStorageUsed() -> Int64 {
-        indexLock.lock(); defer { indexLock.unlock() }
-        return index.values.filter { $0.isAvailable }.reduce(0) { $0 + $1.fileSize }
-    }
-    
-    /// Get offline tracks by artist
-    func offlineTracks(byArtist artist: String) -> [OfflineTrack] {
-        indexLock.lock(); defer { indexLock.unlock() }
-        return index.values.filter { $0.isAvailable && $0.artistName == artist }
+        lock.lock()
+        let tracks = Array(index.values)
+        lock.unlock()
+        return tracks
+            .filter { $0.resolvedFilePath != nil }
             .sorted { $0.downloadedAt > $1.downloadedAt }
     }
-    
-    // MARK: - Mutation
-    
-    /// Register a newly downloaded track
-    func registerOfflineTrack(_ track: OfflineTrack) {
-        indexLock.lock(); defer { indexLock.unlock() }
-        
-        index[track.trackId] = track
-        pathIndex[track.filePath] = track.trackId
-        schedulePersistence()
-        
-        writeDebugLog("[OfflineDB] Registered: \(track.trackName) → \(track.filePath)")
+
+    func search(query: String) -> [OfflineTrack] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return allOfflineTracks() }
+        return allOfflineTracks().filter {
+            $0.trackName.lowercased().contains(needle)
+                || $0.artistName.lowercased().contains(needle)
+                || $0.albumName.lowercased().contains(needle)
+        }
     }
-    
-    /// Update play metadata
+
+    func totalStorageUsed() -> Int64 {
+        return allOfflineTracks().reduce(0) { $0 + $1.fileSize }
+    }
+
+    // MARK: Mutation
+
+    func register(_ track: OfflineTrack) {
+        lock.lock()
+        // Keep play stats if the same track is downloaded again.
+        var stored = track
+        if let existing = index[track.trackId] {
+            stored.lastPlayedAt = existing.lastPlayedAt
+            stored.playCount = existing.playCount
+        }
+        index[track.trackId] = stored
+        lock.unlock()
+        schedulePersistence()
+    }
+
     func recordPlayback(trackId: String) {
-        indexLock.lock()
-        guard var track = index[trackId] else { indexLock.unlock(); return }
+        lock.lock()
+        guard var track = index[trackId] else { lock.unlock(); return }
         track.lastPlayedAt = Date()
         track.playCount += 1
         index[trackId] = track
-        indexLock.unlock()
-        
+        lock.unlock()
         schedulePersistence()
     }
-    
-    /// Remove offline track (delete metadata, optionally delete file)
-    func removeOfflineTrack(trackId: String, deleteFile: Bool = false) {
-        indexLock.lock()
-        guard let track = index.removeValue(forKey: trackId) else { indexLock.unlock(); return }
-        pathIndex.removeValue(forKey: track.filePath)
-        indexLock.unlock()
-        
-        if deleteFile {
-            try? fileManager.removeItem(atPath: track.filePath)
+
+    func remove(trackId: String, deleteFile: Bool) {
+        lock.lock()
+        let removed = index.removeValue(forKey: trackId)
+        lock.unlock()
+        guard let track = removed else { return }
+
+        if deleteFile, let path = track.resolvedFilePath {
+            try? fileManager.removeItem(atPath: path)
         }
-        
         schedulePersistence()
-        writeDebugLog("[OfflineDB] Removed: \(track.trackName)")
     }
-    
-    /// Validate all offline tracks (remove stale entries)
-    func validateAllTracks() {
-        indexLock.lock()
+
+    /// Drops index entries whose file no longer exists. Returns how many were removed.
+    @discardableResult
+    func pruneMissing() -> Int {
+        lock.lock()
         let before = index.count
-        index = index.filter { _, track in
-            fileManager.fileExists(atPath: track.filePath)
-        }
-        let after = index.count
-        indexLock.unlock()
-        
-        if before != after {
-            schedulePersistence()
-            writeDebugLog("[OfflineDB] Validation: removed \(before - after) stale entries")
+        index = index.filter { $0.value.resolvedFilePath != nil }
+        let removed = before - index.count
+        lock.unlock()
+        if removed > 0 { schedulePersistence() }
+        return removed
+    }
+
+    // MARK: Persistence
+
+    /// Writes the index now, on the calling thread.
+    func flush() {
+        ioQueue.sync {
+            pendingWrite?.cancel()
+            pendingWrite = nil
+            writeIndex()
         }
     }
-    
-    // MARK: - Persistence
-    
-    private var persistTimer: DispatchSourceTimer?
-    private static let persistDelay = 2.0
-    
+
     private func schedulePersistence() {
-        persistTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + Self.persistDelay)
-        timer.setEventHandler { [weak self] in self?.persist() }
-        timer.resume()
-        persistTimer = timer
+        ioQueue.async {
+            self.pendingWrite?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.writeIndex() }
+            self.pendingWrite = work
+            self.ioQueue.asyncAfter(deadline: .now() + self.writeDelay, execute: work)
+        }
     }
-    
-    private func persist() {
-        indexLock.lock()
-        let indexCopy = index
-        indexLock.unlock()
-        
+
+    private func writeIndex() {
+        lock.lock()
+        let snapshot = index
+        lock.unlock()
+
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        
-        guard let data = try? encoder.encode(indexCopy) else {
-            writeDebugLog("[OfflineDB] Failed to encode index")
-            return
+        do {
+            try encoder.encode(snapshot).write(to: indexFile, options: .atomic)
+        } catch {
+            writeDebugLog("[OfflineDB] Failed to write index: \(error.localizedDescription)")
         }
-        
-        let indexFile = databasePath.appendingPathComponent("index.json")
-        try? data.write(to: indexFile, options: .atomic)
     }
-    
-    private func loadIndex() {
-        let indexFile = databasePath.appendingPathComponent("index.json")
-        guard let data = try? Data(contentsOf: indexFile) else {
-            writeDebugLog("[OfflineDB] No persisted index found")
-            return
-        }
-        
+
+    private func load() {
+        guard let data = try? Data(contentsOf: indexFile) else { return }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        
-        if let decoded = try? decoder.decode([String: OfflineTrack].self, from: data) {
-            indexLock.lock()
-            index = decoded
-            pathIndex = decoded.reduce(into: [:]) { $0[$1.value.filePath] = $1.key }
-            indexLock.unlock()
-            
-            // Lazy validate: run in background on first load
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in
-                self?.validateAllTracks()
-            }
-            
-            writeDebugLog("[OfflineDB] Loaded \(index.count) offline tracks")
+        do {
+            let decoded = try decoder.decode([String: OfflineTrack].self, from: data)
+            lock.lock(); index = decoded; lock.unlock()
+        } catch {
+            writeDebugLog("[OfflineDB] Failed to read index: \(error.localizedDescription)")
         }
     }
 }

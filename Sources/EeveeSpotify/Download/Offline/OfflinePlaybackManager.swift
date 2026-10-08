@@ -1,179 +1,175 @@
 import Foundation
 import AVFoundation
 
-// MARK: - Offline Playback Manager
+extension Notification.Name {
+    /// Posted on the main queue whenever offline playback starts, stops or finishes.
+    static let offlinePlaybackDidChange = Notification.Name("com.eevee.offline.playbackChanged")
+}
 
-/// Bridges between downloaded tracks and Spotify's player.
-/// Redirects playback to local files when available.
-final class OfflinePlaybackManager: NSObject {
-    static let shared = OfflinePlaybackManager()
-    
-    private let offlineDB = OfflineTrackDatabase.shared
-    private let lock = NSLock()
-    
-    // Track currently playing via offline system
-    private var currentOfflineTrackId: String?
-    private var currentPlayer: AVAudioPlayer?
-    
-    // Observer for playback events
-    private var playbackObservers: NSHashTable<AnyObject> = .weakObjects()
-    
-    override private init() {
+/// Plays downloaded files with `AVAudioPlayer`, independent of Spotify's own player.
+///
+/// Main-thread only. Spotify's player is not paused or controlled, so both can play at once.
+final class OfflinePlaybackManager: NSObject, AVAudioPlayerDelegate {
+
+    static let shared = OfflinePlaybackManager(database: .shared)
+
+    private let database: OfflineTrackDatabase
+    private var player: AVAudioPlayer?
+
+    /// Track currently playing through this manager, if any.
+    private(set) var playingTrackId: String?
+
+    init(database: OfflineTrackDatabase) {
+        self.database = database
         super.init()
-        setupAudioSession()
     }
-    
-    // MARK: - Query
-    
-    /// Check if a track has a local download available for playback
-    func hasOfflineVersion(trackId: String) -> Bool {
-        return offlineDB.isOffline(trackId: trackId)
-    }
-    
-    /// Get the offline track if available
-    func offlineTrack(for trackId: String) -> OfflineTrack? {
-        return offlineDB.offlineTrack(forTrackId: trackId)
-    }
-    
-    /// Get all offline tracks for playlist/library view
-    func allOfflineTracks() -> [OfflineTrack] {
-        return offlineDB.allOfflineTracks()
-    }
-    
-    /// Search offline tracks
-    func searchOfflineTracks(query: String) -> [OfflineTrack] {
-        return offlineDB.search(query: query)
-    }
-    
-    /// Storage info
-    func storageUsedByOfflineTracks() -> Int64 {
-        return offlineDB.totalStorageUsed()
-    }
-    
+
     // MARK: - Playback
-    
-    /// Attempt to play a track from offline storage
-    /// Returns true if offline playback was initiated, false if file not available
+
+    enum PlaybackError: Error {
+        case notOffline
+        case fileMissing
+        case decodeFailed(Error)
+    }
+
+    /// Starts playing a downloaded track, replacing anything this manager was already playing.
     @discardableResult
-    func playOffline(trackId: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        
-        guard let offlineTrack = offlineDB.offlineTrack(forTrackId: trackId) else {
-            return false
+    func play(trackId: String) -> Result<Void, PlaybackError> {
+        guard let track = database.offlineTrack(forTrackId: trackId) else { return .failure(.notOffline) }
+        guard let path = track.resolvedFilePath else {
+            database.pruneMissing()
+            return .failure(.fileMissing)
         }
-        
-        guard FileManager.default.fileExists(atPath: offlineTrack.filePath) else {
-            offlineDB.removeOfflineTrack(trackId: trackId, deleteFile: false)
-            return false
-        }
-        
+
         do {
-            let url = URL(fileURLWithPath: offlineTrack.filePath)
-            let player = try AVAudioPlayer(contentsOf: url)
-            player.play()
-            
-            currentOfflineTrackId = trackId
-            currentPlayer = player
-            
-            // Record playback
-            offlineDB.recordPlayback(trackId: trackId)
-            notifyPlaybackStarted(trackId: trackId, offlineTrack: offlineTrack)
-            
-            writeDebugLog("[OfflinePlayback] Playing offline: \(offlineTrack.trackName)")
-            return true
+            let newPlayer = try AVAudioPlayer(contentsOf: URL(fileURLWithPath: path))
+            newPlayer.delegate = self
+            configureAudioSession()
+            guard newPlayer.prepareToPlay(), newPlayer.play() else {
+                return .failure(.decodeFailed(NSError(domain: "OfflinePlayback", code: -1)))
+            }
+            player?.stop()
+            player = newPlayer
+            playingTrackId = trackId
+            database.recordPlayback(trackId: trackId)
+            postChange()
+            writeDebugLog("[OfflinePlayback] Playing \(track.trackName)")
+            return .success(())
         } catch {
-            writeDebugLog("[OfflinePlayback] Failed to play: \(error.localizedDescription)")
-            return false
+            writeDebugLog("[OfflinePlayback] Cannot play \(track.trackName): \(error.localizedDescription)")
+            return .failure(.decodeFailed(error))
         }
     }
-    
-    /// Stop offline playback
-    func stopOfflinePlayback() {
-        lock.lock(); defer { lock.unlock() }
-        
-        currentPlayer?.stop()
-        currentPlayer = nil
-        currentOfflineTrackId = nil
+
+    func stop() {
+        guard player != nil else { return }
+        player?.stop()
+        player = nil
+        playingTrackId = nil
+        postChange()
     }
-    
-    /// Check if currently playing offline
-    func isPlayingOffline() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return currentOfflineTrackId != nil && currentPlayer?.isPlaying ?? false
-    }
-    
-    // MARK: - Observer API
-    
-    protocol OfflinePlaybackObserver: AnyObject {
-        func offlinePlaybackManager(_ manager: OfflinePlaybackManager, didStartPlayback trackId: String, track: OfflineTrack)
-        func offlinePlaybackManager(_ manager: OfflinePlaybackManager, didStopPlayback trackId: String)
-    }
-    
-    func addObserver(_ observer: OfflinePlaybackObserver) {
-        lock.lock(); defer { lock.unlock() }
-        playbackObservers.add(observer as AnyObject)
-    }
-    
-    func removeObserver(_ observer: OfflinePlaybackObserver) {
-        lock.lock(); defer { lock.unlock() }
-        playbackObservers.remove(observer as AnyObject)
-    }
-    
-    private func notifyPlaybackStarted(trackId: String, offlineTrack: OfflineTrack) {
-        lock.lock()
-        let observers = playbackObservers.allObjects.compactMap { $0 as? OfflinePlaybackObserver }
-        lock.unlock()
-        
-        DispatchQueue.main.async {
-            observers.forEach { $0.offlinePlaybackManager(self, didStartPlayback: trackId, track: offlineTrack) }
+
+    /// Stops if this track is playing, otherwise starts it.
+    @discardableResult
+    func toggle(trackId: String) -> Result<Void, PlaybackError> {
+        if playingTrackId == trackId {
+            stop()
+            return .success(())
         }
+        return play(trackId: trackId)
     }
-    
-    // MARK: - Download Integration
-    
-    /// Called by DownloadManager when a download completes
-    func registerDownloadedTrack(
+
+    // MARK: - AVAudioPlayerDelegate
+
+    func audioPlayerDidFinishPlaying(_ finished: AVAudioPlayer, successfully flag: Bool) {
+        guard finished === player else { return }
+        player = nil
+        playingTrackId = nil
+        postChange()
+    }
+
+    func audioPlayerDecodeErrorDidOccur(_ failed: AVAudioPlayer, error: Error?) {
+        guard failed === player else { return }
+        writeDebugLog("[OfflinePlayback] Decode error: \(error?.localizedDescription ?? "unknown")")
+        stop()
+    }
+
+    // MARK: - Registration
+
+    /// Adds a finished download to the offline index.
+    func register(
         trackId: String,
         filePath: String,
         trackName: String,
         artistName: String,
         albumName: String,
-        duration: Int,
-        artworkURL: String?
+        durationMs: Int,
+        artworkURL: String?,
+        downloadedAt: Date = Date()
     ) {
+        let url = URL(fileURLWithPath: filePath)
         guard FileManager.default.fileExists(atPath: filePath) else {
-            writeDebugLog("[OfflinePlayback] File not found: \(filePath)")
+            writeDebugLog("[OfflinePlayback] Not registering missing file \(filePath)")
             return
         }
-        
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: filePath)[.size] as? Int64) ?? 0
-        let ext = URL(fileURLWithPath: filePath).pathExtension.isEmpty ? "mp3" : URL(fileURLWithPath: filePath).pathExtension
-        
-        let offlineTrack = OfflineTrack(
+
+        let attributes = try? FileManager.default.attributesOfItem(atPath: filePath)
+        let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+
+        var duration = durationMs
+        if duration <= 0, let probe = try? AVAudioPlayer(contentsOf: url) {
+            duration = Int(probe.duration * 1000)
+        }
+
+        database.register(OfflineTrack(
             trackId: trackId,
             filePath: filePath,
             trackName: trackName,
             artistName: artistName,
             albumName: albumName,
-            fileSize: fileSize,
+            fileSize: size,
             duration: duration,
-            fileExtension: ext,
-            artworkURL: artworkURL
-        )
-        
-        offlineDB.registerOfflineTrack(offlineTrack)
-        writeDebugLog("[OfflinePlayback] Registered for offline: \(trackName)")
+            fileExtension: url.pathExtension.isEmpty ? "mp3" : url.pathExtension.lowercased(),
+            artworkURL: artworkURL,
+            downloadedAt: downloadedAt
+        ))
     }
-    
-    // MARK: - Audio Session Setup
-    
-    private func setupAudioSession() {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playback, mode: .default, options: [.duckOthers, .defaultToSpeaker])
-            try session.setActive(true, options: .notifyOthersOnDeactivation)
-        } catch {
-            writeDebugLog("[OfflinePlayback] Audio session setup failed: \(error.localizedDescription)")
+
+    /// Registers finished downloads from before the offline index existed. Returns how many were added.
+    @discardableResult
+    func backfill(from history: [DownloadHistoryEntry]) -> Int {
+        var added = 0
+        for entry in history where database.offlineTrack(forTrackId: entry.trackId) == nil {
+            guard FileManager.default.fileExists(atPath: entry.filePath) else { continue }
+            register(
+                trackId: entry.trackId,
+                filePath: entry.filePath,
+                trackName: entry.trackName,
+                artistName: entry.artistName,
+                albumName: entry.albumName,
+                durationMs: 0,
+                artworkURL: nil,
+                downloadedAt: entry.completedAt
+            )
+            added += 1
         }
+        return added
+    }
+
+    // MARK: - Helpers
+
+    private func postChange() {
+        NotificationCenter.default.post(name: .offlinePlaybackDidChange, object: self)
+    }
+
+    private func configureAudioSession() {
+        #if os(iOS)
+        // Spotify already runs a .playback session; only make sure it is active. Options are left alone.
+        let session = AVAudioSession.sharedInstance()
+        if session.category != .playback {
+            try? session.setCategory(.playback, mode: .default)
+        }
+        try? session.setActive(true)
+        #endif
     }
 }
