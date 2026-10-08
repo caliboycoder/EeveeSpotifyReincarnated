@@ -243,6 +243,9 @@ struct EeveeSpotify: Tweak {
         activateRemoteFlags()
         activateRatingPromptBlock()
 
+        // No-op unless UserDefaults.downloadOptions.enabled is true.
+        DownloadManager.activateDownloadManager()
+
         activateEeveeCrossfadeForce()
         activateEeveeAdBlockerExtended()
         activateUpsellPopupBlocker()
